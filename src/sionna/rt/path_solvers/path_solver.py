@@ -12,6 +12,7 @@ from .image_method import ImageMethod
 from .field_calculator import FieldCalculator
 from .paths import Paths
 from sionna.rt import Scene
+from copy import copy
 
 
 class PathSolver:
@@ -120,6 +121,10 @@ class PathSolver:
         # Instantiate the Field Calculator
         self._field_calculator = FieldCalculator()
 
+        # For saving the path tracing, allowing re-computation of field at reduced complexity
+        self._paths_buffer = None
+        self.recompute = None
+
     @property
     def loop_mode(self):
         # pylint: disable=line-too-long
@@ -151,7 +156,8 @@ class PathSolver:
                  specular_reflection : bool = True,
                  diffuse_reflection : bool = False,
                  refraction : bool = True,
-                 seed : int = 42) -> Paths:
+                 seed : int = 42,
+                 reuse_traces : bool = True) -> Paths:
         # pylint: disable=line-too-long
         r"""
         Executes the solver
@@ -170,6 +176,11 @@ class PathSolver:
         :return: Computed paths
         """
 
+        if ((self.recompute is not None) and 
+            (self._paths_buffer is not None) and 
+            reuse_traces):
+            return self.recompute(scene, self._paths_buffer)
+
         # Check that the scene is all set for simulations
         scene.all_set(radio_map=False)
 
@@ -186,7 +197,7 @@ class PathSolver:
                        tgt_orientations)
 
         # Generate candidates
-        paths_buffer = self._candidate_generator(
+        self._paths_buffer = self._candidate_generator(
             mi_scene=scene.mi_scene,
             src_positions=src_positions,
             tgt_positions=tgt_positions,
@@ -200,50 +211,55 @@ class PathSolver:
             seed=seed
         )
 
-        paths_buffer.schedule()
+        self._paths_buffer.schedule()
         dr.eval()
 
         # Shrink the paths buffer to fit the number of paths effectively found
-        paths_buffer.shrink()
+        self._paths_buffer.shrink()
 
         # Detach the paths geometry to avoid differentiation through the
         # candidate generator
-        paths_buffer.detach_geometry()
+        self._paths_buffer.detach_geometry()
 
         # Solve specular chains and suffixes
-        paths_buffer = self._image_method(
+        self._paths_buffer = self._image_method(
             scene=scene.mi_scene,
-            paths=paths_buffer,
+            paths=self._paths_buffer,
             src_positions=src_positions,
             tgt_positions=tgt_positions
             )
 
-        # Compute channel coefficients and delays
-        paths_buffer = self._field_calculator(
-            scene=scene.mi_scene,
-            wavelength=scene.wavelength,
-            paths=paths_buffer,
-            samples_per_src=samples_per_src,
-            src_positions=src_positions,
-            tgt_positions=tgt_positions,
-            src_orientations=src_orientations,
-            tgt_orientations=tgt_orientations,
-            src_antenna_patterns=src_antenna_patterns,
-            tgt_antenna_patterns=tgt_antenna_patterns,
-            specular_reflection=specular_reflection,
-            diffuse_reflection=diffuse_reflection,
-            refraction=refraction
-        )
+        
+        def recompute(sc, pb):
+            paths_buffer = self._field_calculator(
+                scene=sc.mi_scene,
+                wavelength=sc.wavelength,
+                paths=copy(pb),
+                samples_per_src=samples_per_src,
+                src_positions=src_positions,
+                tgt_positions=tgt_positions,
+                src_orientations=src_orientations,
+                tgt_orientations=tgt_orientations,
+                src_antenna_patterns=src_antenna_patterns,
+                tgt_antenna_patterns=tgt_antenna_patterns,
+                specular_reflection=specular_reflection,
+                diffuse_reflection=diffuse_reflection,
+                refraction=refraction
+            )
 
-        # Discard invalid paths
-        # It was experimentally found that discarding the invalid paths
-        # before re-organizing them into high-dimensional tensors leads to
-        # significant speedups
-        paths_buffer.discard_invalid()
-
-        # Build the path object
-        paths = Paths(scene, src_positions, tgt_positions, tx_velocities,
-                      rx_velocities, synthetic_array, paths_buffer,
-                      rel_ant_positions_tx, rel_ant_positions_rx)
-
-        return paths
+            # Discard invalid paths
+            # It was experimentally found that discarding the invalid paths
+            # before re-organizing them into high-dimensional tensors leads to
+            # significant speedups
+            paths_buffer.discard_invalid()
+    
+            # Build the path object
+            paths = Paths(sc, src_positions, tgt_positions, tx_velocities,
+                          rx_velocities, synthetic_array, paths_buffer,
+                          rel_ant_positions_tx, rel_ant_positions_rx)
+    
+            return paths
+        
+        self.recompute = recompute
+        
+        return self.recompute(scene, self._paths_buffer)
